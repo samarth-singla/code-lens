@@ -2,20 +2,21 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections.abc import Sequence
+from dataclasses import dataclass
 from pathlib import Path
-from typing import TypedDict
 
 import asyncpg
-from openai import AsyncOpenAI as AsyncClient
+from sentence_transformers import SentenceTransformer
 from pgvector.asyncpg import register_vector
 
-from database.init_db import get_database_url
 from ingestion.ast_parser import CodeChunk, parse_file
 
 logger = logging.getLogger(__name__)
 
-EMBEDDING_MODEL = 'text-embedding-3-small'
+DATABASE_URL = 'postgresql://admin:admin@localhost:5432/vector_db'
+EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
 EMBEDDING_BATCH_SIZE = 16
 MAX_CONCURRENT_BATCHES = 4
 
@@ -31,11 +32,21 @@ VALUES ($1, $2, $3, $4, $5)
 '''
 
 
-class ChunkRecord(TypedDict):
-    type: str
-    name: str
-    code: str
+@dataclass(frozen=True, slots=True)
+class ChunkRecord:
     file_path: str
+    chunk_type: str
+    chunk_name: str
+    code_content: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddedChunkRecord:
+    file_path: str
+    chunk_type: str
+    chunk_name: str
+    code_content: str
+    embedding: list[float]
 
 
 async def _init_connection(connection: asyncpg.Connection) -> None:
@@ -44,10 +55,10 @@ async def _init_connection(connection: asyncpg.Connection) -> None:
 
 def _to_chunk_record(file_path: Path, chunk: CodeChunk) -> ChunkRecord:
     return ChunkRecord(
-        type=chunk.kind,
-        name=chunk.name,
-        code=chunk.code,
         file_path=str(file_path),
+        chunk_type=chunk.kind,
+        chunk_name=chunk.name,
+        code_content=chunk.code,
     )
 
 
@@ -78,27 +89,29 @@ def _collect_chunk_records(repo_path: Path) -> list[ChunkRecord]:
 
 
 async def _embed_batch(
-    client: AsyncClient,
+    model: SentenceTransformer,
     batch_index: int,
     batch: Sequence[ChunkRecord],
-) -> list[tuple[str, str, str, str, list[float]]]:
+) -> list[EmbeddedChunkRecord]:
     try:
-        response = await client.embeddings.create(
-            model=EMBEDDING_MODEL,
-            input=[record['code'] for record in batch],
+        embeddings = await asyncio.to_thread(
+            model.encode,
+            [record.code_content for record in batch],
+            normalize_embeddings=True,
+            show_progress_bar=False,
+            convert_to_numpy=True,
         )
     except Exception:
         logger.exception('Embedding request failed for batch %d', batch_index)
         raise
 
-    embeddings = [item.embedding for item in response.data]
     return [
-        (
-            record['file_path'],
-            record['type'],
-            record['name'],
-            record['code'],
-            embedding,
+        EmbeddedChunkRecord(
+            file_path=record.file_path,
+            chunk_type=record.chunk_type,
+            chunk_name=record.chunk_name,
+            code_content=record.code_content,
+            embedding=embedding.tolist(),
         )
         for record, embedding in zip(batch, embeddings, strict=True)
     ]
@@ -119,44 +132,52 @@ async def ingest_repository(repo_path: str) -> None:
     logger.info('Collected %d chunks from %s', len(records), repo_root)
     batches = _batch_records(records)
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
+    model = SentenceTransformer(EMBEDDING_MODEL)
 
-    async with AsyncClient() as client:
-        async with asyncpg.create_pool(
-            dsn=get_database_url(),
-            min_size=1,
-            max_size=5,
-            init=_init_connection,
-        ) as pool:
-            async def _process_batch(
-                batch_index: int,
-                batch: Sequence[ChunkRecord],
-            ) -> list[tuple[str, str, str, str, list[float]]]:
-                async with semaphore:
-                    return await _embed_batch(client, batch_index, batch)
+    async with asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        init=_init_connection,
+    ) as pool:
+        async def _process_batch(
+            batch_index: int,
+            batch: Sequence[ChunkRecord],
+        ) -> list[EmbeddedChunkRecord]:
+            async with semaphore:
+                return await _embed_batch(model, batch_index, batch)
 
-            batch_results = await asyncio.gather(
-                *(
-                    _process_batch(batch_index, batch)
-                    for batch_index, batch in enumerate(batches, start=1)
-                )
+        batch_results = await asyncio.gather(
+            *(
+                _process_batch(batch_index, batch)
+                for batch_index, batch in enumerate(batches, start=1)
             )
+        )
 
-            rows = [row for batch_rows in batch_results for row in batch_rows]
+        rows = [
+            (
+                row.file_path,
+                row.chunk_type,
+                row.chunk_name,
+                row.code_content,
+                row.embedding,
+            )
+            for batch_rows in batch_results
+            for row in batch_rows
+        ]
 
-            try:
-                async with pool.acquire() as connection:
-                    async with connection.transaction():
-                        await connection.executemany(INSERT_CODE_CHUNKS_SQL, rows)
-            except Exception:
-                logger.exception('Failed to insert %d chunks into Postgres', len(rows))
-                raise
+        try:
+            async with pool.acquire() as connection:
+                async with connection.transaction():
+                    await connection.executemany(INSERT_CODE_CHUNKS_SQL, rows)
+        except Exception:
+            logger.exception('Failed to insert %d chunks into Postgres', len(rows))
+            raise
 
     logger.info('Ingested %d chunks from %s', len(records), repo_root)
 
 
 async def main() -> None:
-    import os
-
     await ingest_repository(os.getcwd())
 
 

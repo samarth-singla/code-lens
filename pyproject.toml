@@ -10,11 +10,12 @@ requires-python = ">=3.12"
 dependencies = [
     "asyncpg>=0.30.0",
     "mypy>=1.14.1",
-    "openai>=1.59.0",
+    "ollama>=0.6.2",
     "pgvector>=0.3.6",
     "pydantic-ai>=0.0.14",
     "pydantic-settings>=2.7.1",
     "ruff>=0.8.4",
+    "sentence-transformers>=3.3.1",
     "streamlit>=1.41.1",
     "tiktoken>=0.8.0",
 ]
