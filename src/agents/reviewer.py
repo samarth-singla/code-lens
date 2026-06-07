@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass
 from collections.abc import Sequence
 
@@ -11,10 +12,10 @@ from pydantic_ai.providers.ollama import OllamaProvider
 from pgvector.asyncpg import register_vector
 from sentence_transformers import SentenceTransformer
 
-OLLAMA_BASE_URL = 'http://localhost:11434'
+OLLAMA_BASE_URL = 'http://localhost:11434/v1'
 DATABASE_URL = 'postgresql://admin:admin@localhost:5432/vector_db'
 EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
-LLM_MODEL = 'llama3'
+LLM_MODEL = os.getenv('OLLAMA_MODEL', 'llama3.2:1b')
 TOP_K = 3
 
 
@@ -96,6 +97,15 @@ def format_retrieved_chunks(chunks: Sequence[RetrievedChunk]) -> str:
     )
 
 
+def build_review_prompt(query: str, chunks: Sequence[RetrievedChunk]) -> str:
+    return (
+        'Use the repository context below to answer the user directly. '
+        'If the context is insufficient, say what is missing.\n\n'
+        f'User Query:\n{query}\n\n'
+        f'Repository Context:\n{format_retrieved_chunks(chunks)}'
+    )
+
+
 def build_agent() -> Agent[ReviewerDeps, str]:
     model = OllamaModel(
         LLM_MODEL,
@@ -106,8 +116,8 @@ def build_agent() -> Agent[ReviewerDeps, str]:
         deps_type=ReviewerDeps,
         system_prompt=(
             'You are Code-Lens, a senior software engineer. '
-            'Always use the retrieve_code_context tool before answering. '
-            'Use the retrieved repository context to produce a concise code review or bug fix.'
+            'Answer directly from the provided repository context. '
+            'Do not mention tools, prompts, or internal reasoning.'
         ),
     )
 
@@ -122,8 +132,10 @@ def build_agent() -> Agent[ReviewerDeps, str]:
 async def review_code(query: str) -> str:
     deps = await create_reviewer_deps()
     try:
+        chunks = await search_relevant_chunks(deps, query)
         agent = build_agent()
-        result = await agent.run(query, deps=deps)
+        prompt = build_review_prompt(query, chunks)
+        result = await agent.run(prompt, deps=deps)
         return result.output
     finally:
         await close_reviewer_deps(deps)

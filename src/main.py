@@ -1,33 +1,32 @@
 from __future__ import annotations
 
 import asyncio
+import sys
+from pathlib import Path
 
-from agents.reviewer import build_agent, close_reviewer_deps, create_reviewer_deps
+if __package__ is None or __package__ == '':
+    sys.path.append(str(Path(__file__).resolve().parent))
+
+from agents.reviewer import review_code
 
 PROMPT = 'Code-Lens> '
 EXIT_COMMANDS = {'exit', 'quit'}
 
 
 async def run_cli() -> None:
-    agent = build_agent()
-    deps = await create_reviewer_deps()
-    try:
-        while True:
-            try:
-                query = await asyncio.to_thread(input, PROMPT)
-            except (EOFError, KeyboardInterrupt):
-                break
+    while True:
+        try:
+            query = await asyncio.to_thread(input, PROMPT)
+        except (EOFError, KeyboardInterrupt):
+            break
 
-            query = query.strip()
-            if not query:
-                continue
-            if query.lower() in EXIT_COMMANDS:
-                break
+        query = query.strip()
+        if not query:
+            continue
+        if query.lower() in EXIT_COMMANDS:
+            break
 
-            result = await agent.run(query, deps=deps)
-            print(result.output)
-    finally:
-        await close_reviewer_deps(deps)
+        print(await review_code(query))
 
 
 def main() -> None:

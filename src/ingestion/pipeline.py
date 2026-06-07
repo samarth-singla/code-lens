@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import sys
 from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
+
+if __package__ is None or __package__ == '':
+    sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 import asyncpg
 from sentence_transformers import SentenceTransformer
@@ -19,6 +23,7 @@ DATABASE_URL = 'postgresql://admin:admin@localhost:5432/vector_db'
 EMBEDDING_MODEL = 'all-MiniLM-L6-v2'
 EMBEDDING_BATCH_SIZE = 16
 MAX_CONCURRENT_BATCHES = 4
+EXCLUDED_DIR_NAMES = {'.git', '.venv', '__pycache__', '.mypy_cache', '.ruff_cache'}
 
 INSERT_CODE_CHUNKS_SQL = '''
 INSERT INTO code_chunks (
@@ -76,6 +81,9 @@ def _collect_chunk_records(repo_path: Path) -> list[ChunkRecord]:
         if not file_path.is_file():
             continue
 
+        if any(part in EXCLUDED_DIR_NAMES for part in file_path.parts):
+            continue
+
         try:
             chunks = parse_file(str(file_path))
         except (OSError, SyntaxError, UnicodeDecodeError):
@@ -117,6 +125,15 @@ async def _embed_batch(
     ]
 
 
+async def _create_pool() -> asyncpg.Pool:
+    return await asyncpg.create_pool(
+        dsn=DATABASE_URL,
+        min_size=1,
+        max_size=5,
+        init=_init_connection,
+    )
+
+
 async def ingest_repository(repo_path: str) -> None:
     repo_root = Path(repo_path).expanduser().resolve()
     if not repo_root.exists() or not repo_root.is_dir():
@@ -134,50 +151,58 @@ async def ingest_repository(repo_path: str) -> None:
     semaphore = asyncio.Semaphore(MAX_CONCURRENT_BATCHES)
     model = SentenceTransformer(EMBEDDING_MODEL)
 
-    async with asyncpg.create_pool(
-        dsn=DATABASE_URL,
-        min_size=1,
-        max_size=5,
-        init=_init_connection,
-    ) as pool:
-        async def _process_batch(
-            batch_index: int,
-            batch: Sequence[ChunkRecord],
-        ) -> list[EmbeddedChunkRecord]:
-            async with semaphore:
-                return await _embed_batch(model, batch_index, batch)
+    try:
+        pool = await _create_pool()
+    except (OSError, asyncpg.PostgresError) as error:
+        raise RuntimeError(
+            'Unable to connect to PostgreSQL at ' + DATABASE_URL + '. '
+            'Start the local database with `docker compose up -d postgres` '
+            'or set DATABASE_URL to a reachable PostgreSQL instance.'
+        ) from error
 
-        batch_results = await asyncio.gather(
-            *(
-                _process_batch(batch_index, batch)
-                for batch_index, batch in enumerate(batches, start=1)
+    try:
+        async with pool:
+            async def _process_batch(
+                batch_index: int,
+                batch: Sequence[ChunkRecord],
+            ) -> list[EmbeddedChunkRecord]:
+                async with semaphore:
+                    return await _embed_batch(model, batch_index, batch)
+
+            batch_results = await asyncio.gather(
+                *(
+                    _process_batch(batch_index, batch)
+                    for batch_index, batch in enumerate(batches, start=1)
+                )
             )
-        )
 
-        rows = [
-            (
-                row.file_path,
-                row.chunk_type,
-                row.chunk_name,
-                row.code_content,
-                row.embedding,
-            )
-            for batch_rows in batch_results
-            for row in batch_rows
-        ]
+            rows = [
+                (
+                    row.file_path,
+                    row.chunk_type,
+                    row.chunk_name,
+                    row.code_content,
+                    row.embedding,
+                )
+                for batch_rows in batch_results
+                for row in batch_rows
+            ]
 
-        try:
-            async with pool.acquire() as connection:
-                async with connection.transaction():
-                    await connection.executemany(INSERT_CODE_CHUNKS_SQL, rows)
-        except Exception:
-            logger.exception('Failed to insert %d chunks into Postgres', len(rows))
-            raise
+            try:
+                async with pool.acquire() as connection:
+                    async with connection.transaction():
+                        await connection.executemany(INSERT_CODE_CHUNKS_SQL, rows)
+            except Exception:
+                logger.exception('Failed to insert %d chunks into Postgres', len(rows))
+                raise
+    finally:
+        await pool.close()
 
     logger.info('Ingested %d chunks from %s', len(records), repo_root)
 
 
 async def main() -> None:
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s %(message)s')
     await ingest_repository(os.getcwd())
 
 
