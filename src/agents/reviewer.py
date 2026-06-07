@@ -114,6 +114,7 @@ def build_agent() -> Agent[ReviewerDeps, str]:
     agent = Agent[ReviewerDeps, str](
         model,
         deps_type=ReviewerDeps,
+        model_settings={'tool_choice': 'none'},
         system_prompt=(
             'You are Code-Lens, a senior software engineer. '
             'Answer directly from the provided repository context. '
