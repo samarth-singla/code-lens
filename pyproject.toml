@@ -1,0 +1,38 @@
+[project]
+name = "code-lens"
+version = "0.1.0"
+description = "An autonomous AST-aware code analysis agent leveraging multi-agent RAG for automated bug fixing and PR review."
+authors = [
+    { name = "Samarth Singla", email = "samysingla146@gmail.com" }
+]
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "asyncpg>=0.30.0",
+    "mypy>=1.14.1",
+    "pgvector>=0.3.6",
+    "pydantic-ai>=0.0.14",
+    "pydantic-settings>=2.7.1",
+    "ruff>=0.8.4",
+    "streamlit>=1.41.1",
+    "tiktoken>=0.8.0",
+]
+
+[tool.ruff]
+line-length = 79
+extend-exclude = ['migrations', '*.ipynb']
+
+[tool.ruff.lint]
+preview = true
+select = ['I', 'F', 'E', 'W', 'PL', 'PT']
+ignore = ['PLR2004']
+
+[tool.ruff.format]
+preview = true
+quote-style = 'single'
+
+[tool.mypy]
+strict = true
+show_error_codes = true
+pretty = true
+ignore_missing_imports = true
